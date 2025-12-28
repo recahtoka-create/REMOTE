@@ -1,0 +1,547 @@
+import os
+import time
+import subprocess
+import sys
+import requests
+from datetime import datetime
+
+def check_internet():
+    """Check if internet connection is available using multiple methods"""
+    methods = [
+        # Method 1: Ping Google DNS
+        lambda: subprocess.run(["ping", "-c", "1", "8.8.8.8"], 
+                             capture_output=True, timeout=5).returncode == 0,
+        
+        # Method 2: Ping Cloudflare DNS
+        lambda: subprocess.run(["ping", "-c", "1", "1.1.1.1"], 
+                             capture_output=True, timeout=5).returncode == 0,
+        
+        # Method 3: Try HTTP connection to reliable site
+        lambda: check_http_connection(),
+        
+        # Method 4: Check if serveo.net is reachable (since we're using it)
+        lambda: check_serveo_connection(),
+    ]
+    
+    for i, method in enumerate(methods, 1):
+        try:
+            if method():
+                print(f"✓ Internet check {i} passed")
+                return True
+        except Exception as e:
+            print(f"✗ Internet check {i} failed: {str(e)[:50]}")
+    
+    print("All internet checks failed")
+    return False
+
+def check_http_connection():
+    """Check HTTP connection to reliable websites"""
+    test_sites = [
+        "http://httpbin.org/get",
+        "http://google.com",
+        "http://github.com"
+    ]
+    
+    for site in test_sites:
+        try:
+            response = requests.get(site, timeout=10)
+            if response.status_code < 500:  # Any non-server-error status
+                return True
+        except:
+            continue
+    return False
+
+def check_serveo_connection():
+    """Check if serveo.net is accessible"""
+    try:
+        # Try to connect to serveo.net
+        result = subprocess.run(["timeout", "5", "ssh", "-o", "ConnectTimeout=5", 
+                               "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                               "serveo.net", "echo", "test"],
+                             capture_output=True)
+        return result.returncode == 0
+    except:
+        return False
+
+def check_tunnel_health():
+    """Check if tunnel is actually working, not just the process"""
+    if not os.path.exists("tunnel.log"):
+        return False, "No tunnel log found"
+    
+    # Check recent log entries (last 2 minutes)
+    try:
+        with open("tunnel.log", "r") as f:
+            lines = f.readlines()
+            recent_lines = lines[-20:] if len(lines) > 20 else lines
+        
+        # Look for error patterns
+        error_patterns = [
+            "Connection refused",
+            "Connection closed",
+            "Network is unreachable",
+            "No route to host",
+            "Operation timed out",
+            "ssh_exchange_identification",
+            "Connection reset by peer",
+            "Permission denied",
+            "Too many authentication failures"
+        ]
+        
+        for line in recent_lines:
+            for pattern in error_patterns:
+                if pattern in line:
+                    return False, f"Tunnel error: {pattern}"
+        
+        # Look for success patterns
+        success_patterns = [
+            "Forwarding",
+            "tunnel.+-+[0-9]+\\.serveo\\.net",
+            "https://.*\\.serveo\\.net"
+        ]
+        
+        for line in reversed(recent_lines[-10:]):  # Check last 10 lines
+            if any(pattern in line for pattern in success_patterns):
+                return True, "Tunnel appears healthy"
+                
+    except Exception as e:
+        return False, f"Log check error: {str(e)[:50]}"
+    
+    return False, "No recent successful tunnel activity"
+
+def send_whatsapp_message(url):
+    """Send WhatsApp message with tunnel URL"""
+    if url:
+        whatsapp_url = f"https://api.whatsapp.com/send?phone=+256768418400&text={url}"
+        print(f"WhatsApp URL: {whatsapp_url}")
+        
+        # Try to open in browser
+        os.system(f'termux-open-url "{whatsapp_url}" 2>/dev/null || echo "Could not open URL automatically"')
+        return True
+    return False
+
+def start_tunnel():
+    """Start the SSH tunnel using serveo.net with enhanced error handling"""
+    print("Starting SSH tunnel...")
+    
+    # Kill any existing tunnel
+    os.system("pkill -f 'ssh.*serveo.net' 2>/dev/null")
+    time.sleep(2)
+    
+    with open("start_tunnel.sh", "w") as f:
+        f.write('''#!/data/data/com.termux/files/usr/bin/bash
+echo "[$(date)] Starting tunnel..." >> tunnel.log
+while true; do
+    echo "[$(date)] Attempting SSH connection to serveo.net..." >> tunnel.log
+    ssh -o StrictHostKeyChecking=no \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=3 \
+        -o ConnectTimeout=30 \
+        -R 80:localhost:8080 \
+        serveo.net 2>&1 | tee -a tunnel.log
+    
+    exit_code=${PIPESTATUS[0]}
+    echo "[$(date)] SSH exited with code: $exit_code" >> tunnel.log
+    
+    # Analyze exit code
+    case $exit_code in
+        0)   echo "[$(date)] Clean exit, waiting before reconnect..." >> tunnel.log ;;
+        1)   echo "[$(date)] General error, waiting 60s..." >> tunnel.log ;;
+        255) echo "[$(date)] SSH connection failed, waiting 60s..." >> tunnel.log ;;
+        *)   echo "[$(date)] Unknown error ($exit_code), waiting 30s..." >> tunnel.log ;;
+    esac
+    
+    sleep 60
+done
+''')
+    
+    os.system("chmod +x start_tunnel.sh")
+    
+    # Start tunnel in background
+    process = subprocess.Popen(["/data/data/com.termux/files/usr/bin/bash", "start_tunnel.sh"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+    
+    print(f"Tunnel started in background (PID: {process.pid})...")
+    return process.pid
+
+def extract_tunnel_url():
+    """Extract tunnel URL from log file with retries and validation"""
+    max_retries = 15  # Increased retries
+    for i in range(max_retries):
+        if os.path.exists("tunnel.log"):
+            try:
+                with open("tunnel.log", "r") as f:
+                    content = f.read()
+                
+                # Multiple patterns to catch different serveo URL formats
+                import re
+                patterns = [
+                    r'https://[a-zA-Z0-9-]+\.serveo\.net',
+                    r'Forwarding.*(https://[^\s]+)',
+                    r'tunnel\.([a-zA-Z0-9-]+-\d+)\.serveo\.net',
+                    r'Your\s+.*(https?://[^\s]+)'
+                ]
+                
+                for pattern in patterns:
+                    matches = re.findall(pattern, content)
+                    if matches:
+                        url = matches[-1]  # Get most recent
+                        if not url.startswith('http'):
+                            url = f"https://{url}"
+                        
+                        # Validate URL is actually reachable
+                        if validate_tunnel_url(url):
+                            return url
+            
+            except Exception as e:
+                print(f"Error parsing log: {str(e)[:50]}")
+        
+        if i < max_retries - 1:
+            wait_time = min(5 * (i + 1), 30)  # Progressive backoff
+            print(f"Waiting for tunnel URL... ({i+1}/{max_retries}, next check in {wait_time}s)")
+            time.sleep(wait_time)
+    
+    return None
+
+def validate_tunnel_url(url):
+    """Validate that tunnel URL is actually working"""
+    try:
+        # Try to access the tunnel
+        response = requests.get(url, timeout=10)
+        return response.status_code < 500
+    except:
+        return False
+
+def wait_for_internet(timeout_minutes=60):
+    """Wait for internet connection with intelligent checking"""
+    start_time = time.time()
+    timeout_seconds = timeout_minutes * 60
+    last_network_state = None
+    
+    print(f"Waiting for stable internet connection (max {timeout_minutes} minutes)...")
+    
+    while time.time() - start_time < timeout_seconds:
+        current_state = check_internet()
+        
+        # Only print when state changes
+        if current_state != last_network_state:
+            if current_state:
+                print("✅ Internet connection detected!")
+            else:
+                print("❌ Internet connection lost")
+            last_network_state = current_state
+        
+        if current_state:
+            # Check if it's stable (not flaky)
+            time.sleep(2)
+            if check_internet():  # Second check
+                print("✅ Internet connection is stable")
+                return True
+        
+        # Show progress
+        elapsed = int(time.time() - start_time)
+        remaining = timeout_seconds - elapsed
+        
+        if elapsed % 200 == 0:  # Print every 30 seconds
+            print(f"⏳ Elapsed: {elapsed//60}m{elapsed%60}s | Remaining: {remaining//60}m{remaining%60}s")
+        
+        time.sleep(5)
+    
+    print(f"⏰ No stable internet after {timeout_minutes} minutes")
+    return False
+
+def diagnose_connection_issue():
+    """Diagnose what kind of connection issue we're having"""
+    print("\n🔍 Running connection diagnostics...")
+    
+    diagnostics = []
+    
+    # 1. Check basic connectivity
+    try:
+        ping_google = subprocess.run(["ping", "-c", "1", "8.8.8.8"], 
+                                   capture_output=True, timeout=5).returncode == 0
+        diagnostics.append(("Basic ping", "✓" if ping_google else "✗"))
+    except:
+        diagnostics.append(("Basic ping", "✗"))
+    
+    # 2. Check DNS resolution
+    try:
+        dns_check = subprocess.run(["nslookup", "google.com"], 
+                                 capture_output=True, timeout=5).returncode == 0
+        diagnostics.append(("DNS resolution", "✓" if dns_check else "✗"))
+    except:
+        diagnostics.append(("DNS resolution", "✗"))
+    
+    # 3. Check HTTP connectivity
+    try:
+        http_check = requests.get("http://httpbin.org/get", timeout=5).status_code == 200
+        diagnostics.append(("HTTP access", "✓" if http_check else "✗"))
+    except:
+        diagnostics.append(("HTTP access", "✗"))
+    
+    # 4. Check serveo.net specifically
+    try:
+        serveo_check = subprocess.run(["timeout", "3", "nc", "-z", "serveo.net", "22"], 
+                                    capture_output=True).returncode == 0
+        diagnostics.append(("Serveo.net access", "✓" if serveo_check else "✗"))
+    except:
+        diagnostics.append(("Serveo.net access", "✗"))
+    
+    # 5. Check local server
+    try:
+        local_server = requests.get("http://localhost:8080", timeout=2).status_code < 500
+        diagnostics.append(("Local server", "✓" if local_server else "✗"))
+    except:
+        diagnostics.append(("Local server", "✗"))
+    
+    # Print diagnostics
+    print("Diagnostic Results:")
+    for name, status in diagnostics:
+        print(f"  {name}: {status}")
+    
+    # Provide suggestions based on diagnostics
+    if diagnostics[3][1] == "✗":  # Serveo.net access failed
+        print("\n💡 Suggestion: Serveo.net might be blocked. Try using a VPN or different tunnel service.")
+    elif diagnostics[4][1] == "✗":  # Local server failed
+        print("\n💡 Suggestion: Local HTTP server is not running. Check if port 8080 is available.")
+
+def monitor_tunnel():
+    """Monitor tunnel and restart if needed with enhanced detection"""
+    last_url = None
+    last_sent_time = 0
+    send_interval = 3600  # 1 hour between resends
+    consecutive_errors = 0
+    max_consecutive_errors = 3
+    
+    while True:
+        try:
+            # Check overall internet first
+            if not check_internet():
+                print("❌ Internet connection issue detected")
+                consecutive_errors += 1
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    diagnose_connection_issue()
+                    consecutive_errors = 0
+                
+                print("Waiting for internet recovery...")
+                if wait_for_internet(60):
+                    print("✅ Internet recovered, restarting tunnel...")
+                    start_tunnel()
+                    time.sleep(15)
+                continue
+            
+            # Check tunnel health specifically
+            tunnel_healthy, tunnel_message = check_tunnel_health()
+            
+            if not tunnel_healthy:
+                print(f"⚠️ Tunnel issue: {tunnel_message}")
+                consecutive_errors += 1
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    print("Multiple tunnel failures detected. Restarting...")
+                    start_tunnel()
+                    consecutive_errors = 0
+                    time.sleep(20)
+                else:
+                    time.sleep(30)
+                continue
+            
+            # Reset error counter if we got here
+            consecutive_errors = 0
+            
+            # Extract current URL
+            current_url = extract_tunnel_url()
+            
+            if current_url:
+                print(f"✅ Current tunnel URL: {current_url}")
+                
+                # Save URL to file
+                with open("ge.txt", "w") as f:
+                    f.write(current_url)
+                    f.write(f"\nLast updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Send WhatsApp if URL changed or enough time passed
+                current_time = time.time()
+                if current_url != last_url or (current_time - last_sent_time) > send_interval:
+                    print("📱 Sending WhatsApp message...")
+                    if send_whatsapp_message(current_url):
+                        last_sent_time = current_time
+                        last_url = current_url
+                        print("✅ WhatsApp message sent")
+                    else:
+                        print("❌ Failed to send WhatsApp message")
+            else:
+                print("⚠️ Could not extract tunnel URL")
+                time.sleep(30)
+            
+            time.sleep(60)  # Check every minute
+            
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"⚠️ Unexpected error in monitor: {str(e)[:100]}")
+            time.sleep(30)
+
+def main():
+    # Check if user typed "star"
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "star":
+        print("⭐ Star command detected. Starting program...")
+    else:
+        print("Usage: python script.py star")
+        print("Please type 'star' to start the program")
+        return
+    
+    # Clear old logs
+    for logfile in ["tunnel.log", "server.log"]:
+        if os.path.exists(logfile):
+            os.remove(logfile)
+    
+    # Install required packages
+    print("📦 Checking/Installing required packages...")
+    pkgs = ["python", "openssh", "tmux", "nmap-ncat"]
+    
+    for pkg in pkgs:
+        print(f"  Checking {pkg}...")
+        try:
+            result = subprocess.run(f"pkg list-installed | grep -q '^{pkg}/' || apt install -y {pkg}",
+                                  shell=True, capture_output=True)
+            if result.returncode == 0:
+                print(f"    ✓ {pkg} is available")
+            else:
+                print(f"    ✗ Failed to install {pkg}")
+        except Exception as e:
+            print(f"    ⚠️ Error with {pkg}: {str(e)[:50]}")
+        time.sleep(1)
+    
+    # Start HTTP server in tmux
+    
+    print("\n🌐 Starting Python HTTP server...")
+    
+    # Kill existing tmux session if any
+    k="termux-setup-storage"
+    os.system(f"{k}")
+    os.system("tmux kill-session -t myserver 2>/dev/null")
+    
+    # Create server script with better error handling
+    with open("run_server.sh", "w") as f:
+        f.write('''#!/data/data/com.termux/files/usr/bin/bash
+cd $HOME
+echo "[$(date)] Starting HTTP server on port 8080..." >> server.log
+while true; do
+    if netstat -tuln 2>/dev/null | grep -q ":8080 "; then
+        echo "[$(date)] Port 8080 already in use, waiting..." >> server.log
+        sleep 10
+    else
+        echo "[$(date)] Starting Python HTTP server..." >> server.log
+        python -m http.server 8080 2>&1 | tee -a server.log
+        EXIT_CODE=$?
+        echo "[$(date)] HTTP server exited with code $EXIT_CODE" >> server.log
+        sleep 5
+    fi
+done
+''')
+    
+    os.system("chmod +x run_server.sh")
+    
+    # Start server in tmux
+    os.system("tmux new-session -d -s myserver './run_server.sh'")
+    print("✅ HTTP server started on port 8080")
+    
+    # Wait for server to start
+    time.sleep(3)
+    
+    # Check if server is actually running
+    try:
+        response = requests.get("http://localhost:8080", timeout=5)
+        if response.status_code < 500:
+            print("✅ Local HTTP server verified")
+        else:
+            print("⚠️ Local server returned error")
+    except:
+        print("❌ Could not connect to local HTTP server")
+    
+    # Wait for internet before starting tunnel
+    print("\n📶 Checking internet connection...")
+    if not check_internet():
+        print("❌ No internet connection detected.")
+        diagnose_connection_issue()
+        
+        if wait_for_internet(60):
+            print("✅ Internet connected! Starting tunnel...")
+        else:
+            print("❌ Failed to get stable internet connection.")
+            print("Please check your mobile data/WiFi connection and try again.")
+            return
+    
+    # Start tunnel
+    print("\n🚇 Starting SSH tunnel to serveo.net...")
+    start_tunnel()
+    
+    # Wait for tunnel to establish with progress indicator
+    print("⏳ Waiting for tunnel to establish...")
+    for i in range(1, 31):  # 30 seconds max
+        print(f"  {i}/30 seconds", end="\r")
+        
+        # Check if we have a valid URL yet
+        url = extract_tunnel_url()
+        if url:
+            print(f"\n✅ Tunnel established after {i} seconds!")
+            break
+        
+        time.sleep(1)
+    
+    # Extract and display initial URL
+    initial_url = extract_tunnel_url()
+    if initial_url:
+        print(f"\n🎉 TUNNEL READY!")
+        print(f"🔗 Your public URL: {initial_url}")
+        print(f"🌐 Local server: http://localhost:8080")
+        
+        # Save to file
+        with open("ge.txt", "w") as f:
+            f.write(initial_url)
+            f.write(f"\nGenerated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Send initial WhatsApp
+        print("\n📱 Sending initial WhatsApp message...")
+        if send_whatsapp_message(initial_url):
+            print("✅ WhatsApp message sent")
+        else:
+            print("⚠️ Could not send WhatsApp automatically")
+    else:
+        print("⚠️ Could not get tunnel URL")
+        print("Checking tunnel status...")
+        diagnose_connection_issue()
+    
+    print("\n" + "="*60)
+    print("🚀 SYSTEM ACTIVE - MONITORING STARTED")
+    print("="*60)
+    print("• Local HTTP: http://localhost:8080")
+    print("• Tunnel log: tunnel.log")
+    print("• Server log: server.log")
+    print("• URL file: ge.txt")
+    print("• Press Ctrl+C to stop")
+    print("="*60)
+    
+    # Start monitoring
+    try:
+        monitor_tunnel()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Shutting down...")
+        os.system("tmux kill-session -t myserver 2>/dev/null")
+        os.system("pkill -f 'ssh.*serveo.net' 2>/dev/null")
+        os.system("pkill -f 'start_tunnel.sh' 2>/dev/null")
+        print("✅ All services stopped")
+        print("👋 Goodbye!")
+
+if __name__ == "__main__":
+    # Install requests if not available
+    try:
+        import requests
+    except ImportError:
+        print("Installing requests library...")
+        os.system("pip install requests")
+        import requests
+    
+    main()
