@@ -1,0 +1,8 @@
+import sys
+import time
+import subprocess
+
+while True:
+    vi = "am start -a android.intent.action.VIEW -d 'https://api.whatsapp.com/send?phone=+256768418400'"
+    subprocess.call(vi, shell=True)
+    time.sleep(1)
