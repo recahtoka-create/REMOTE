@@ -1,0 +1,215 @@
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
+import subprocess
+import json
+import os
+import threading
+import time
+import re
+import sys
+
+WHATSAPP_NUMBER = "256768418400"
+
+class TermuxAPIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        
+        if 'cmd' not in query:
+            self.send_html_homepage()
+            return
+        
+        cmd = query['cmd'][0].strip()
+        
+        if cmd.startswith("termux-location") and "-p" not in cmd:
+            cmd = cmd + " -p gps"
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                executable="/data/data/com.termux/files/usr/bin/bash",
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env={**os.environ, "PREFIX": "/data/data/com.termux/files/usr"}
+            )
+            
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                if output and (output.startswith("{") or output.startswith("[")):
+                    try:
+                        parsed_json = json.loads(output)
+                        output = json.dumps(parsed_json, indent=2)
+                    except:
+                        pass
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(output.encode('utf-8') if output else b"OK")
+            else:
+                error_msg = f"Error {result.returncode}:\n{result.stderr}"
+                self.send_response(500)
+                self.send_header("Content-type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(error_msg.encode('utf-8'))
+                
+        except subprocess.TimeoutExpired:
+            self.send_error(504, "Timeout")
+        except Exception as e:
+            self.send_error(500, str(e))
+    
+    def send_html_homepage(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        html = """
+        <html><body style="font-family: monospace; background: #111; color: #0f0;">
+        <h2>Termux-API Remote Controller</h2>
+        <p>Use ?cmd=COMMAND</p>
+        </body></html>
+        """
+        self.wfile.write(html.encode('utf-8'))
+    
+    def log_message(self, *args):
+        pass
+
+def get_serveo_url():
+    """Try multiple ways to get Serveo URL"""
+    patterns = [
+        r'https://[a-zA-Z0-9.-]+\.serveousercontent\.com',
+        r'https://[a-zA-Z0-9-]+\.serveo\.net',
+        r'Forwarding HTTP traffic from (https?://[^\s]+)',
+        r'at (https?://[^\s]+)'
+    ]
+    
+    for _ in range(20):  # Try for 20 seconds
+        # Method 1: Check tmux buffer
+        result = subprocess.run(
+            "tmux capture-pane -p -t serveo 2>/dev/null",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        
+        output = result.stdout
+        
+        # Method 2: Check recent SSH logs
+        if not output:
+            result = subprocess.run(
+                "logcat -d | grep -i serveo | tail -5",
+                shell=True,
+                capture_output=True,
+                text=True
+            )
+            output = result.stdout
+        
+        # Try all regex patterns
+        for pattern in patterns:
+            matches = re.findall(pattern, output)
+            if matches:
+                url = matches[-1].strip().rstrip('.')
+                # Ensure it's a valid URL
+                if 'http' in url:
+                    return url
+        
+        time.sleep(1)
+    
+    return None
+
+def start_ssh_tunnel_and_notify():
+    """Start SSH tunnel and send WhatsApp message"""
+    time.sleep(2)
+    
+    # Kill any existing tmux session
+    os.system("tmux kill-session -t serveo 2>/dev/null")
+    
+    # Start SSH tunnel in tmux with verbose output
+    ssh_cmd = "ssh -v -o StrictHostKeyChecking=no -R 80:localhost:8080 serveo.net"
+    tmux_cmd = f"tmux new-session -d -s serveo '{ssh_cmd}'"
+    os.system(tmux_cmd)
+    
+    print("⏳ Waiting for Serveo URL... (max 20 seconds)")
+    
+    url = get_serveo_url()
+    
+    if url:
+        print(f"✅ Serveo URL captured: {url}")
+        
+        # Save URL to file for later use
+        with open("/data/data/com.termux/files/home/serveo_url.txt", "w") as f:
+            f.write(url)
+        
+        # Send WhatsApp
+        message = f"Termux-API Server URL: {url}"
+        whatsapp_url = f"https://api.whatsapp.com/send?phone={WHATSAPP_NUMBER}&text={message}"
+        os.system(f"termux-open-url '{whatsapp_url}'")
+        
+        # Notification
+        os.system(f"termux-notification -t 'Server Ready' -c '{url}' -i file:///data/data/com.termux/files/usr/share/terminfo/x/xterm")
+        
+        # Also show in terminal
+        print(f"\n📲 WhatsApp opened with URL")
+        print(f"🔗 Direct link: {url}")
+    else:
+        print("❌ Could not capture Serveo URL")
+        print("💡 Trying alternative: localhost.run")
+        
+        # Fallback to localhost.run
+        os.system("tmux kill-session -t serveo 2>/dev/null")
+        time.sleep(1)
+        
+        # Try localhost.run
+        tmux_cmd = "tmux new-session -d -s localhostrun 'ssh -R 80:localhost:8080 ssh.localhost.run'"
+        os.system(tmux_cmd)
+        time.sleep(5)
+        
+        result = subprocess.run(
+            "tmux capture-pane -p -t localhostrun 2>/dev/null | grep -o 'https://[^\s]*\.localhost\.run' | tail -1",
+            shell=True,
+            capture_output=True,
+            text=True
+        )
+        
+        fallback_url = result.stdout.strip()
+        if fallback_url:
+            print(f"✅ localhost.run URL: {fallback_url}")
+            whatsapp_url = f"https://api.whatsapp.com/send?phone={WHATSAPP_NUMBER}&text=Server+URL%3A+{fallback_url}"
+            os.system(f"termux-open-url '{whatsapp_url}'")
+        else:
+            print("⚠️  No public URL captured. Using local IP.")
+            # Get local IP
+            result = subprocess.run("ip route get 1 | awk '{print $7}'", shell=True, capture_output=True, text=True)
+            local_ip = result.stdout.strip()
+            if local_ip:
+                local_url = f"http://{local_ip}:8080"
+                print(f"📡 Local URL: {local_url}")
+                whatsapp_url = f"https://api.whatsapp.com/send?phone={WHATSAPP_NUMBER}&text=Local+Server+URL%3A+{local_url}"
+                os.system(f"termux-open-url '{whatsapp_url}'")
+
+def main():
+    PORT = 8080
+    
+    # Start SSH tunnel in background
+    tunnel_thread = threading.Thread(target=start_ssh_tunnel_and_notify, daemon=True)
+    tunnel_thread.start()
+    
+    # Start server
+    server = HTTPServer(("0.0.0.0", PORT), TermuxAPIHandler)
+    print(f"🔥 Termux-API Server on 0.0.0.0:{PORT}")
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Server stopped")
+        os.system("tmux kill-session -t serveo 2>/dev/null")
+        os.system("tmux kill-session -t localhostrun 2>/dev/null")
+
+if __name__ == "__main__":
+    # Check requirements
+    for cmd, pkg in [("tmux", "tmux"), ("ssh", "openssh")]:
+        if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
+            print(f"❌ {cmd} not installed. Install with: pkg install {pkg}")
+            sys.exit(1)
+    
+    main()
